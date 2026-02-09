@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: clm-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-clm_automation}
+      POSTGRES_USER: ${DB_USER:-clm_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-ChangeMe123!}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-clm_admin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - clm-network
+
+  backend:
+    build: ./backend
+    container_name: clm-backend
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-clm_automation}
+      DB_USER: ${DB_USER:-clm_admin}
+      DB_PASSWORD: ${DB_PASSWORD:-ChangeMe123!}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
+      PORT: 3001
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - clm-network
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: clm-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - clm-network
+    restart: unless-stopped
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: clm-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@clm.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - clm-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  clm-network:
+    driver: bridge

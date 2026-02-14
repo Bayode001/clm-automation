@@ -453,6 +453,10 @@ app.get('/api-docs', (req, res) => {
                 'PUT /api/contracts/:id': 'Update contract',
                 'DELETE /api/contracts/:id': 'Delete contract',
                 'GET /api/contracts/stats': 'Dashboard statistics',
+                'GET /api/contracts/search': 'Search contracts by keyword',
+                'GET /api/contracts/filter': 'Filter contracts by criteria',
+                'GET /api/contracts/upcoming-reviews': 'Upcoming review dates',
+                'GET /api/contracts/export/csv': 'Export to CSV',
                 'GET /api/contracts/expiring-soon': 'Expiring contracts'
             }
         }

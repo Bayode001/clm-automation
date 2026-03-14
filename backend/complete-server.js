@@ -2,6 +2,20 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 
+// ==================== NEW CODE START ====================
+// Additional required modules
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const nodemailer = require('nodemailer');
+const cron = require('node-cron');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
+require('dotenv').config();
+// ==================== NEW CODE END ====================
+
 const app = express();
 const PORT = 3003;
 
@@ -14,9 +28,145 @@ const pool = new Pool({
     password: 'clm123',
 });
 
+// ==================== NEW CODE START ====================
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Email transporter
+const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: process.env.SMTP_PORT || 587,
+    secure: false,
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+    }
+});
+
+// Swagger configuration
+const swaggerOptions = {
+    definition: {
+        openapi: '3.0.0',
+        info: {
+            title: 'CLM Automation API',
+            version: '1.0.0',
+            description: 'Contract Lifecycle Management API',
+        },
+        servers: [
+            {
+                url: `http://localhost:${PORT}`,
+                description: 'Development server',
+            },
+        ],
+        components: {
+            securitySchemes: {
+                bearerAuth: {
+                    type: 'http',
+                    scheme: 'bearer',
+                    bearerFormat: 'JWT',
+                },
+            },
+        },
+    },
+    apis: ['./complete-server.js'],
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+// ==================== NEW CODE END ====================
+
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// ==================== NEW CODE START ====================
+// Serve static files for uploads
+app.use('/uploads', express.static('uploads'));
+
+// Swagger UI
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+// Multer configuration for file uploads
+const uploadDir = 'uploads/';
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const fileFilter = (req, file, cb) => {
+    // Accept only PDF, DOC, DOCX
+    const allowedTypes = /pdf|doc|docx/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (mimetype && extname) {
+        return cb(null, true);
+    } else {
+        cb(new Error('Only PDF, DOC, DOCX files are allowed'));
+    }
+};
+
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+    fileFilter: fileFilter
+});
+
+// Authentication middleware
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ success: false, error: 'Access token required' });
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ success: false, error: 'Invalid or expired token' });
+        req.user = user;
+        next();
+    });
+}
+
+// Email notification function
+async function sendExpiryNotifications() {
+    try {
+        // Find contracts expiring in the next 7 days
+        const result = await pool.query(`
+            SELECT c.*, u.email as owner_email 
+            FROM contracts c
+            LEFT JOIN users u ON c.owner_user_id = u.email
+            WHERE c.status = 'active'
+            AND c.expiration_date IS NOT NULL
+            AND c.expiration_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+        `);
+
+        for (const contract of result.rows) {
+            if (!contract.owner_email) continue;
+
+            await transporter.sendMail({
+                from: '"CLM System" <noreply@yourdomain.com>',
+                to: contract.owner_email,
+                subject: `Contract Expiring Soon: ${contract.title}`,
+                text: `Your contract "${contract.title}" with ${contract.counterparty_name} expires on ${contract.expiration_date}. Please take necessary action.`,
+                html: `<p>Your contract <strong>${contract.title}</strong> with ${contract.counterparty_name} expires on <strong>${contract.expiration_date}</strong>.</p><p>Please take necessary action.</p>`
+            });
+            console.log(`Expiry notification sent to ${contract.owner_email} for contract ${contract.id}`);
+        }
+    } catch (error) {
+        console.error('Error sending expiry notifications:', error);
+    }
+}
+
+// Schedule daily notifications at 8 AM
+cron.schedule('0 8 * * *', () => {
+    console.log('Running daily expiry check...');
+    sendExpiryNotifications();
+});
+// ==================== NEW CODE END ====================
 
 // 1. Health endpoint
 app.get('/health', async (req, res) => {
@@ -37,6 +187,65 @@ app.get('/health', async (req, res) => {
         });
     }
 });
+
+// ==================== NEW CODE START ====================
+// Authentication routes
+app.post('/auth/register', async (req, res) => {
+    try {
+        const { email, password, name } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ success: false, error: 'Email and password required' });
+        }
+
+        // Check if user exists
+        const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        if (existing.rows.length > 0) {
+            return res.status(409).json({ success: false, error: 'User already exists' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const result = await pool.query(
+            'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, role',
+            [email, hashedPassword, name]
+        );
+
+        const user = result.rows[0];
+        const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+
+        res.status(201).json({ success: true, token, user });
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ success: false, error: 'Registration failed' });
+    }
+});
+
+app.post('/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ success: false, error: 'Email and password required' });
+        }
+
+        const result = await pool.query('SELECT id, email, password_hash, name, role FROM users WHERE email = $1', [email]);
+        if (result.rows.length === 0) {
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+        }
+
+        const user = result.rows[0];
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid) {
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+        delete user.password_hash;
+        res.json({ success: true, token, user });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ success: false, error: 'Login failed' });
+    }
+});
+// ==================== NEW CODE END ====================
 
 // 2. GET all contracts
 app.get('/api/contracts', async (req, res) => {
@@ -120,7 +329,7 @@ app.post('/api/contracts', async (req, res) => {
     }
 });
 
-// 4. GET dashboard statistics - MOVED ABOVE :id
+// 4. GET dashboard statistics
 app.get('/api/contracts/stats', async (req, res) => {
     try {
         const [total, active, byType] = await Promise.all([
@@ -146,7 +355,7 @@ app.get('/api/contracts/stats', async (req, res) => {
     }
 });
 
-// 5. GET expiring contracts - MOVED ABOVE :id
+// 5. GET expiring contracts
 app.get('/api/contracts/expiring-soon', async (req, res) => {
     try {
         const days = req.query.days || 30;
@@ -266,7 +475,7 @@ app.get('/api/contracts/filter', async (req, res) => {
     }
 });
 
-// 8.  Get contracts with upcoming review dates
+// 8. Get contracts with upcoming review dates
 app.get('/api/contracts/upcoming-reviews', async (req, res) => {
     try {
         const days = req.query.days || 30;
@@ -292,7 +501,7 @@ app.get('/api/contracts/upcoming-reviews', async (req, res) => {
     }
 });
 
-// 9.  Export contracts to CSV
+// 9. Export contracts to CSV
 app.get('/api/contracts/export/csv', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM contracts ORDER BY created_at DESC');
@@ -385,7 +594,7 @@ app.put('/api/contracts/:id', async (req, res) => {
     }
 });
 
-// 11. GET contract by ID - NOW COMES AFTER SPECIFIC ROUTES
+// 11. GET contract by ID
 app.get('/api/contracts/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM contracts WHERE id = $1', [req.params.id]);
@@ -439,13 +648,59 @@ app.delete('/api/contracts/:id', async (req, res) => {
     }
 });
 
-// 13. API documentation
-app.get('/api-docs', (req, res) => {
+// ==================== NEW CODE START ====================
+// File upload endpoint
+app.post('/api/contracts/:id/upload', authenticateToken, upload.single('document'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No file uploaded' });
+        }
+
+        const fileUrl = `/uploads/${req.file.filename}`;
+        const result = await pool.query(
+            'UPDATE contracts SET document_url = $1, updated_at = NOW() WHERE id = $2 RETURNING id, document_url',
+            [fileUrl, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Contract not found' });
+        }
+
+        res.json({
+            success: true,
+            message: 'File uploaded successfully',
+            document_url: fileUrl
+        });
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ success: false, error: 'Upload failed' });
+    }
+});
+
+// Manual notification trigger
+app.post('/api/notify/expiring', authenticateToken, async (req, res) => {
+    try {
+        await sendExpiryNotifications();
+        res.json({ success: true, message: 'Notifications sent' });
+    } catch (error) {
+        console.error('Notification error:', error);
+        res.status(500).json({ success: false, error: 'Failed to send notifications' });
+    }
+});
+// ==================== NEW CODE END ====================
+
+// 13. API documentation (keeping original for backward compatibility)
+app.get('/api-docs-old', (req, res) => {
     res.json({
         message: 'CLM Automation API Documentation',
         version: '1.0.0',
         endpoints: {
             health: 'GET /health',
+            auth: {
+                'POST /auth/register': 'Register new user',
+                'POST /auth/login': 'Login user'
+            },
             contracts: {
                 'GET /api/contracts': 'List all contracts',
                 'POST /api/contracts': 'Create new contract',
@@ -457,7 +712,9 @@ app.get('/api-docs', (req, res) => {
                 'GET /api/contracts/filter': 'Filter contracts by criteria',
                 'GET /api/contracts/upcoming-reviews': 'Upcoming review dates',
                 'GET /api/contracts/export/csv': 'Export to CSV',
-                'GET /api/contracts/expiring-soon': 'Expiring contracts'
+                'GET /api/contracts/expiring-soon': 'Expiring contracts',
+                'POST /api/contracts/:id/upload': 'Upload contract document',
+                'POST /api/notify/expiring': 'Send expiry notifications'
             }
         }
     });
@@ -470,10 +727,13 @@ app.use('*', (req, res) => {
         error: 'Route not found',
         availableRoutes: [
             'GET /health',
+            'POST /auth/register',
+            'POST /auth/login',
             'GET /api-docs',
+            'GET /api-docs-old',
             'GET /api/contracts',
-            'GET /api/contracts/:id',
             'POST /api/contracts',
+            'GET /api/contracts/:id',
             'PUT /api/contracts/:id',
             'DELETE /api/contracts/:id',
             'GET /api/contracts/stats',
@@ -481,8 +741,9 @@ app.use('*', (req, res) => {
             'GET /api/contracts/filter',
             'GET /api/contracts/upcoming-reviews',
             'GET /api/contracts/export/csv',
-            'GET /api/contracts/expiring-soon'
-
+            'GET /api/contracts/expiring-soon',
+            'POST /api/contracts/:id/upload',
+            'POST /api/notify/expiring'
         ]
     });
 });
@@ -492,8 +753,9 @@ app.listen(PORT, () => {
     console.log(`✅ CLM Automation Backend Started!`);
     console.log(`📍 Port: ${PORT}`);
     console.log(`🔗 Health Check: http://localhost:${PORT}/health`);
-    console.log(`📄 API Documentation: http://localhost:${PORT}/api-docs`);
+    console.log(`🔐 Auth: http://localhost:${PORT}/auth/register | /auth/login`);
+    console.log(`📄 Swagger UI: http://localhost:${PORT}/api-docs`);
     console.log(`📊 Contracts API: http://localhost:${PORT}/api/contracts`);
-    console.log(`🎯 Dashboard Stats: http://localhost:${PORT}/api/contracts/stats`);
+    console.log(`📁 Uploads: http://localhost:${PORT}/uploads`);
     console.log(`\n🔄 Ready for frontend on http://localhost:3000`);
 });
